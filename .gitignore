@@ -36,3 +36,8 @@ serve_images/
 
 # PyCharm
 ./idea
+AGENTS.md
+CLAUDE.md
+.agent/rules/rules.md
+eval_logs/
+runs/

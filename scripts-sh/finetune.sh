@@ -1,8 +1,9 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
-  --vla_path /data1/Models/openvla-7b \
-  --data_root_dir /data3/embodied/modified_libero_rlds \
+export PYTHONPATH="/workspace/laiminxin/vla-opt/third_party/CogVLA:/workspace/laiminxin/vla-opt:${PYTHONPATH}"
+CUDA_VISIBLE_DEVICES=6 torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
+  --vla_path openvla/openvla-7b \
+  --data_root_dir /workspace/laiminxin/datasets/libero_rlds \
   --dataset_name libero_4_task_suites_no_noops \
-  --run_root_dir /data3/zrs/models/cogvla-libero-4task \
+  --run_root_dir /workspace/laiminxin/vla-opt/third_party/CogVLA/runs/cogvla-libero \
   --use_l1_regression True \
   --use_diffusion False \
   --use_film True \
@@ -23,6 +24,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nnodes 1 --nproc-per-node 4
   --save_latest_checkpoint_only False \
   --image_aug True \
   --lora_rank 32 \
-  --wandb_entity "ENTITY" \
-  --wandb_project "PROJECT" \
-  --run_id_note cogvla-libero-4task
+  --wandb_entity "mxlai1224-ustc" \
+  --wandb_project "cogvla-libero" \
+  --run_id_note cogvla-libero-4task \
+  --monitor_log_interval 500 \
+  --lfp_monitor_interval 500 \
+  --wandb_log_freq 500

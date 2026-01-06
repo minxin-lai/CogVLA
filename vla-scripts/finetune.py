@@ -32,6 +32,36 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
 
+# Monitoring components (optional, imported only when enabled)
+try:
+    from utils.monitoring import Monitor, PruningObserver
+    from utils.monitoring.cogvla import (
+        CogVLALfpAdapter,
+        CogVLAMonitoring,
+        CogVLAMonitoringConfig,
+        # Vision-Language interaction monitors
+        FiLMObserver,
+        MoERouterObserver,
+        AggregationObserver,
+        CogVLAFiLMAdapter,
+        CogVLAMoEAdapter,
+        CogVLAAggregationAdapter,
+    )
+    MONITORING_AVAILABLE = True
+except ImportError:
+    MONITORING_AVAILABLE = False
+    Monitor = None
+    PruningObserver = None
+    CogVLALfpAdapter = None
+    CogVLAMonitoring = None
+    CogVLAMonitoringConfig = None
+    FiLMObserver = None
+    MoERouterObserver = None
+    AggregationObserver = None
+    CogVLAFiLMAdapter = None
+    CogVLAMoEAdapter = None
+    CogVLAAggregationAdapter = None
+
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
@@ -132,6 +162,16 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+
+    # Monitoring
+    enable_monitor: bool = True                      # If True, enables training monitor
+    monitor_log_interval: int = 100                  # Console log interval for monitor
+    enable_lfp_monitor: bool = True                  # If True, enables LFP routing monitor (only when use_lfp=True)
+    lfp_monitor_interval: int = 500                  # Record detailed LFP stats every N steps
+    enable_film_monitor: bool = True                 # If True, enables FiLM modulation monitor (only when use_film=True)
+    enable_moe_monitor: bool = True                  # If True, enables MoE Router monitor (only when use_aggr=True)
+    enable_aggr_monitor: bool = True                 # If True, enables Aggregation Tokens monitor (only when use_aggr=True)
+    export_to_wandb: bool = True                     # If True, exports monitoring metrics to wandb
 
     # fmt: on
 
@@ -890,6 +930,50 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
 
+    # Initialize training monitor
+    cogvla_monitor = None
+    train_monitor = None
+    lfp_observer = None
+    film_observer = None
+    moe_observer = None
+    aggr_observer = None
+    if distributed_state.is_main_process:
+        want_monitoring = any([
+            cfg.enable_monitor,
+            cfg.enable_lfp_monitor,
+            cfg.enable_film_monitor,
+            cfg.enable_moe_monitor,
+            cfg.enable_aggr_monitor,
+        ])
+        if want_monitoring:
+            if not MONITORING_AVAILABLE or CogVLAMonitoring is None or CogVLAMonitoringConfig is None:
+                print("[Warning] Monitoring requested but utils.monitoring not available. Skipping.")
+            else:
+                monitor_cfg = CogVLAMonitoringConfig(
+                    enable_train_monitor=cfg.enable_monitor,
+                    enable_lfp_monitor=cfg.use_lfp and cfg.enable_lfp_monitor,
+                    enable_film_monitor=cfg.use_film and cfg.enable_film_monitor,
+                    enable_moe_monitor=cfg.use_aggr and cfg.enable_moe_monitor,
+                    enable_aggr_monitor=cfg.use_aggr and cfg.enable_aggr_monitor,
+                    monitor_log_interval=cfg.monitor_log_interval,
+                    detailed_log_interval=cfg.lfp_monitor_interval,
+                    pruning_event_log_interval=cfg.wandb_log_freq,
+                    enable_tensorboard=False,
+                    film_sample_layers=[0, 9, 18, 26],
+                )
+                cogvla_monitor = CogVLAMonitoring(
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    config_name=cfg.dataset_name,
+                    cfg=monitor_cfg,
+                )
+                train_monitor = cogvla_monitor.train_monitor
+                lfp_observer = cogvla_monitor.lfp_observer
+                film_observer = cogvla_monitor.film_observer
+                moe_observer = cogvla_monitor.moe_observer
+                aggr_observer = cogvla_monitor.aggr_observer
+                print("[Monitor] CogVLA monitoring initialized")
+
     # Print detected constants
     print(
         "Detected constants:\n"
@@ -929,7 +1013,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     dist.barrier()
 
     # Load and set VLA config
-    vla_cfg = AutoConfig.from_pretrained(cfg.vla_path)
+    vla_cfg = AutoConfig.from_pretrained(cfg.vla_path, trust_remote_code=True)
 
     vla_cfg.text_config.use_lfp = cfg.use_lfp
     vla_cfg.text_config.lfp_average_factor = cfg.lfp_average_factor
@@ -1023,6 +1107,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA with DDP
     # This function wraps a `Module` on the outermost layer
     vla = wrap_ddp(vla, device_id, find_unused=True)
+
+    # Attach monitoring adapters after DDP wrapping (if enabled)
+    if cogvla_monitor is not None:
+        cogvla_monitor.attach(vla)
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -1243,6 +1331,107 @@ def finetune(cfg: FinetuneConfig) -> None:
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
+            # Log to training monitor
+            if train_monitor is not None and log_step % cfg.wandb_log_freq == 0:
+                with train_monitor.step(log_step, mode="train") as step_handle:
+                    # Prepare extra metrics dict
+                    extra_metrics = {}
+                    if "curr_action_l1_loss" in smoothened_metrics:
+                        extra_metrics["curr_action_l1_loss"] = smoothened_metrics.get("curr_action_l1_loss")
+                    if "next_actions_l1_loss" in smoothened_metrics:
+                        extra_metrics["next_actions_l1_loss"] = smoothened_metrics.get("next_actions_l1_loss")
+                    if "curr_action_accuracy" in smoothened_metrics:
+                        extra_metrics["curr_action_accuracy"] = smoothened_metrics.get("curr_action_accuracy")
+                    if "next_actions_accuracy" in smoothened_metrics:
+                        extra_metrics["next_actions_accuracy"] = smoothened_metrics.get("next_actions_accuracy")
+
+                    # Log to monitor
+                    step_handle.log(
+                        loss=smoothened_metrics.get("loss_value"),
+                        lr=scheduler.get_last_lr()[0],
+                        extra=extra_metrics if extra_metrics else None,
+                    )
+
+                    # Export to wandb if enabled
+                    if cfg.export_to_wandb:
+                        wandb_log_dict = {
+                            "monitor/train/loss": smoothened_metrics.get("loss_value"),
+                            "monitor/train/lr": scheduler.get_last_lr()[0],
+                        }
+                        if "curr_action_l1_loss" in smoothened_metrics:
+                            wandb_log_dict["monitor/train/curr_action_l1_loss"] = smoothened_metrics.get("curr_action_l1_loss")
+                        if "next_actions_l1_loss" in smoothened_metrics:
+                            wandb_log_dict["monitor/train/next_actions_l1_loss"] = smoothened_metrics.get("next_actions_l1_loss")
+                        if "curr_action_accuracy" in smoothened_metrics:
+                            wandb_log_dict["monitor/train/curr_action_accuracy"] = smoothened_metrics.get("curr_action_accuracy")
+                        if "next_actions_accuracy" in smoothened_metrics:
+                            wandb_log_dict["monitor/train/next_actions_accuracy"] = smoothened_metrics.get("next_actions_accuracy")
+                        wandb.log(wandb_log_dict, step=log_step)
+
+            # Update all observer steps (for per-step stats)
+            if lfp_observer is not None:
+                lfp_observer.log_step(log_step)
+            if film_observer is not None:
+                film_observer.log_step(log_step)
+            if moe_observer is not None:
+                moe_observer.log_step(log_step)
+            if aggr_observer is not None:
+                aggr_observer.log_step(log_step)
+
+            # Export all monitoring stats to wandb (at detailed log interval)
+            if cfg.export_to_wandb and log_step > 0 and log_step % cfg.lfp_monitor_interval == 0:
+                wandb_monitoring_dict = {}
+
+                # Export LFP pruning stats
+                if lfp_observer is not None:
+                    lfp_summary = lfp_observer.get_summary()
+                    if "overall" in lfp_summary and lfp_summary["overall"]["count"] > 0:
+                        wandb_monitoring_dict.update({
+                            "monitor/lfp/prune_ratio_mean": lfp_summary["overall"]["prune_ratio"]["mean"],
+                            "monitor/lfp/tokens_before_mean": lfp_summary["overall"]["tokens_before"]["mean"],
+                            "monitor/lfp/tokens_after_mean": lfp_summary["overall"]["tokens_after"]["mean"],
+                            "monitor/lfp/pruned_pct_mean": 1.0 - lfp_summary["overall"]["prune_ratio"]["mean"],
+                        })
+
+                        # Log per-component stats if available
+                        if "by_component" in lfp_summary:
+                            for comp_name, comp_stats in lfp_summary["by_component"].items():
+                                if comp_stats["count"] > 0:
+                                    wandb_monitoring_dict[f"monitor/lfp/{comp_name}/prune_ratio"] = comp_stats["prune_ratio"]["mean"]
+                                    wandb_monitoring_dict[f"monitor/lfp/{comp_name}/tokens_after"] = comp_stats["tokens_after"]["mean"]
+
+                # Export FiLM modulation stats
+                if film_observer is not None:
+                    film_summary = film_observer.get_summary()
+                    if "gamma_norm" in film_summary and film_summary["gamma_norm"]["count"] > 0:
+                        wandb_monitoring_dict.update({
+                            "monitor/film/gamma_norm_mean": film_summary["gamma_norm"]["mean"],
+                            "monitor/film/beta_norm_mean": film_summary["beta_norm"]["mean"],
+                            "monitor/film/modulation_strength_mean": film_summary["modulation_strength"]["mean"],
+                        })
+
+                # Export MoE Router stats
+                if moe_observer is not None:
+                    moe_summary = moe_observer.get_summary()
+                    if "siglip_weight" in moe_summary and moe_summary["siglip_weight"]["count"] > 0:
+                        wandb_monitoring_dict.update({
+                            "monitor/moe/siglip_weight_mean": moe_summary["siglip_weight"]["mean"],
+                            "monitor/moe/dino_weight_mean": moe_summary["dino_weight"]["mean"],
+                            "monitor/moe/entropy_mean": moe_summary["entropy"]["mean"],
+                        })
+
+                # Export Aggregation stats
+                if aggr_observer is not None:
+                    aggr_summary = aggr_observer.get_summary()
+                    if "compression_ratio" in aggr_summary and aggr_summary["compression_ratio"]["count"] > 0:
+                        wandb_monitoring_dict.update({
+                            "monitor/aggr/compression_ratio": aggr_summary["compression_ratio"]["mean"],
+                        })
+
+                # Log all monitoring stats to wandb
+                if wandb_monitoring_dict:
+                    wandb.log(wandb_monitoring_dict, step=log_step)
+
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
                 lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
@@ -1306,6 +1495,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+
+    if cogvla_monitor is not None:
+        summary_paths = cogvla_monitor.finalize()
+        if "train" in summary_paths:
+            print(f"[Monitor] Training summary saved: {summary_paths['train']}")
+        if "lfp" in summary_paths:
+            print(f"[Monitor] LFP summary saved: {summary_paths['lfp']}")
+        if "film" in summary_paths:
+            print(f"[Monitor] FiLM summary saved: {summary_paths['film']}")
+        if "moe" in summary_paths:
+            print(f"[Monitor] MoE summary saved: {summary_paths['moe']}")
+        if "aggr" in summary_paths:
+            print(f"[Monitor] Aggregation summary saved: {summary_paths['aggr']}")
 
 
 if __name__ == "__main__":
