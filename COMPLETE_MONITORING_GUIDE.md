@@ -3,7 +3,7 @@
 本指南只保留**一个入口**来监控 CogVLA 训练过程，避免在训练脚本中堆一堆 adapter。
 底层仍然保留模块化的 observer/adapters，但你只需要关心一个对象：`CogVLAMonitoring`。
 
-> 通用监控设计与输出格式，请先看：`/workspace/laiminxin/vla-opt/utils/README.md`。
+> 通用监控设计与输出格式，请先看：`/workspace/laiminxin/vla-opt/monitor/README.md`。
 
 ---
 
@@ -20,7 +20,7 @@
 ### 1.1 初始化（run_dir/run_id 已就绪后）
 
 ```python
-from utils.monitoring.cogvla import CogVLAMonitoring, CogVLAMonitoringConfig
+from monitor.pruning.adapters.cogvla import CogVLAMonitoring, CogVLAMonitoringConfig
 
 monitor_cfg = CogVLAMonitoringConfig(
     enable_train_monitor=True,
@@ -104,7 +104,7 @@ CogVLA 是三段式结构：
 
 ---
 
-## 4) 输出结构（与 utils.monitoring 统一）
+## 4) 输出结构（与 monitor 统一）
 
 ```text
 runs/{run_id}/
@@ -133,5 +133,5 @@ A: 只开 `enable_train_monitor=True`，其它全部 False。
 
 ## 6) 进一步阅读
 
-- `/workspace/laiminxin/vla-opt/utils/README.md`
-- `/workspace/laiminxin/vla-opt/utils/monitoring/README.md`
+- `/workspace/laiminxin/vla-opt/monitor/README.md`
+- `/workspace/laiminxin/vla-opt/monitor/pruning/README.md`

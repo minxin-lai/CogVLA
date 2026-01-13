@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import draccus
 import numpy as np
@@ -36,11 +36,11 @@ from experiments.robot.openvla_utils import (
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
+    get_vla_action,
     resize_image_for_policy,
 )
 from experiments.robot.robot_utils import (
     DATE_TIME,
-    get_action,
     get_image_resize_size,
     get_model,
     invert_gripper_action,
@@ -48,6 +48,12 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
+
+try:
+    from tracer.run_writer import TraceSample, TraceWriter
+except Exception:
+    TraceSample = None
+    TraceWriter = None
 
 
 # Define task suite constants
@@ -122,6 +128,18 @@ class GenerateConfig:
     wandb_project: str = "your-wandb-project"        # Name of WandB project
 
     seed: int = 7                                    # Random Seed (for reproducibility)
+
+    #################################################################################################################
+    # Tracing: dump routing + save images for overlay
+    #################################################################################################################
+    trace_out_dir: str = ""                          # If set, write dumps/images under this directory
+    trace_max_dumps_per_run: int = 1                 # Safety cap to avoid excessive disk usage (0 = unlimited)
+    trace_save_policy_images: bool = True            # Save policy input images (224x224) for overlay
+    trace_dump_routing: bool = True                  # Dump LFP routing signals (keep_mask/keep_prob)
+    trace_dump_attn: bool = False                    # Dump reduced LLM self-attention evidence (task→vision)
+    trace_attn_layers: str = "31"                    # Comma-separated layer indices, e.g. "5,15,30"
+    trace_dump_moe: bool = True                      # Dump MoE fusion ratios if available
+    trace_primary_lfp_layer: Optional[int] = None    # Prefer this LFP layer as primary routing signal
 
     # fmt: on
 
@@ -283,6 +301,9 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    task_id: Optional[int] = None,
+    episode_idx: Optional[int] = None,
+    trace_writer: Optional[Any] = None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -308,6 +329,7 @@ def run_episode(
 
     # Run episode
     success = False
+    query_idx = 0
     try:
         while t < max_steps + cfg.num_steps_wait:
             # Do nothing for the first few timesteps to let objects stabilize
@@ -322,18 +344,34 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
-                # Query model to get action
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
+                trace_sample = None
+                if trace_writer is not None:
+                    trace_sample = trace_writer.new_sample(
+                        task_id=task_id,
+                        episode_idx=episode_idx,
+                        step_idx=t,
+                        query_idx=query_idx,
+                        layout="task_ep",
+                    )
+
+                actions = get_vla_action(
+                    cfg=cfg,
+                    vla=model,
                     processor=processor,
+                    obs=observation,
+                    task_label=task_description,
                     action_head=action_head,
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
+                    trace_writer=trace_writer,
+                    trace_sample=trace_sample,
+                    trace_task_id=task_id,
+                    trace_episode_idx=episode_idx,
+                    trace_step_idx=t,
+                    trace_query_idx=query_idx,
                 )
                 action_queue.extend(actions)
+                query_idx += 1
 
             # Get action from queue
             action = action_queue.popleft()
@@ -367,6 +405,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    trace_writer: Optional[Any] = None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -415,6 +454,9 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            task_id=task_id,
+            episode_idx=episode_idx,
+            trace_writer=trace_writer,
         )
 
         # Update counters
@@ -478,6 +520,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
+    trace_writer = None
+    if cfg.trace_out_dir:
+        if TraceWriter is None:
+            raise ImportError(
+                "tracer is not importable; set PYTHONPATH=/workspace/laiminxin/vla-opt/third_party/CogVLA:/workspace/laiminxin/vla-opt:$PYTHONPATH"
+            )
+        trace_writer = TraceWriter(Path(cfg.trace_out_dir), max_dumps_per_run=int(cfg.trace_max_dumps_per_run))
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks)):
@@ -494,6 +544,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            trace_writer=trace_writer,
         )
 
     # Calculate final success rate
@@ -514,6 +565,28 @@ def eval_libero(cfg: GenerateConfig) -> float:
             }
         )
         wandb.save(local_log_filepath)
+
+    if cfg.trace_out_dir:
+        try:
+            writer = TraceWriter(Path(cfg.trace_out_dir))
+            out_path, out_jsonl = writer.finalize(
+                extra={
+                    "task_suite": cfg.task_suite_name,
+                    "pretrained_checkpoint": str(cfg.pretrained_checkpoint),
+                    "final_success_rate": float(final_success_rate),
+                    "trace_dump_routing": bool(cfg.trace_dump_routing),
+                    "trace_dump_attn": bool(cfg.trace_dump_attn),
+                    "trace_attn_layers": str(cfg.trace_attn_layers),
+                    "trace_dump_moe": bool(cfg.trace_dump_moe),
+                    "trace_primary_lfp_layer": cfg.trace_primary_lfp_layer,
+                }
+            )
+            log_message(f"Trace report written: {out_path}", log_file)
+            log_message(f"Token log written: {out_jsonl}", log_file)
+            out_summary = Path(cfg.trace_out_dir) / "report" / "tokens_summary.json"
+            log_message(f"Token summary written: {out_summary}", log_file)
+        except Exception as e:
+            log_message(f"WARNING: failed to write trace report: {e}", log_file)
 
     # Close log file
     if log_file:

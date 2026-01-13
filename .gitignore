@@ -41,3 +41,6 @@ CLAUDE.md
 .agent/rules/rules.md
 eval_logs/
 runs/
+.agent/rules/GEMINI.md
+rollouts/
+experiments/

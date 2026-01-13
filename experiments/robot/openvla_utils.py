@@ -750,6 +750,12 @@ def get_vla_action(
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
+    trace_writer: Optional[Any] = None,
+    trace_sample: Optional[Any] = None,
+    trace_task_id: Optional[int] = None,
+    trace_episode_idx: Optional[int] = None,
+    trace_step_idx: Optional[int] = None,
+    trace_query_idx: Optional[int] = None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -767,6 +773,31 @@ def get_vla_action(
     Returns:
         List[np.ndarray]: Predicted actions
     """
+    do_trace = bool(getattr(cfg, "trace_out_dir", "")) and trace_writer is not None and trace_sample is not None
+    if do_trace:
+        do_trace = bool(getattr(trace_sample, "should_dump", True))
+
+    tracer = None
+    trace_cfg = None
+    if do_trace:
+        try:
+            from tracer.adapters.cogvla import CogVLATraceConfig, CogVLATracer
+
+            attn_layers = tuple(int(p.strip()) for p in str(getattr(cfg, "trace_attn_layers", "")).split(",") if p.strip())
+            trace_cfg = CogVLATraceConfig(
+                dump_routing=bool(getattr(cfg, "trace_dump_routing", True)),
+                dump_attn=bool(getattr(cfg, "trace_dump_attn", False)),
+                attn_layers=attn_layers,
+                dump_moe=bool(getattr(cfg, "trace_dump_moe", True)),
+                save_policy_images=bool(getattr(cfg, "trace_save_policy_images", True)),
+                primary_lfp_layer=getattr(cfg, "trace_primary_lfp_layer", None),
+            )
+            tracer = CogVLATracer(vla, config=trace_cfg)
+        except Exception:
+            tracer = None
+            trace_cfg = None
+            do_trace = False
+
     with torch.inference_mode():
 
         # Collect all input images
@@ -804,21 +835,52 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
-        # Generate action
-        if action_head is None:
-            # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
-        else:
-            # Custom action head for continuous actions
-            action, _ = vla.predict_action(
-                **inputs,
-                unnorm_key=cfg.unnorm_key,
-                do_sample=False,
-                proprio=proprio,
-                proprio_projector=proprio_projector,
-                noisy_action_projector=noisy_action_projector,
-                action_head=action_head,
+        t0 = time.time()
+        if tracer is not None:
+            tracer.__enter__()
+        try:
+            # Generate action
+            if action_head is None:
+                # Standard VLA output (single-image inputs, discrete actions)
+                action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            else:
+                # Custom action head for continuous actions
+                action, _ = vla.predict_action(
+                    **inputs,
+                    unnorm_key=cfg.unnorm_key,
+                    do_sample=False,
+                    proprio=proprio,
+                    proprio_projector=proprio_projector,
+                    noisy_action_projector=noisy_action_projector,
+                    action_head=action_head,
+                )
+        finally:
+            if tracer is not None:
+                tracer.__exit__(None, None, None)
+        latency_s = time.time() - t0
+
+        if do_trace and tracer is not None and trace_writer is not None and trace_sample is not None and trace_cfg is not None:
+            policy_images = [primary_image] + list(all_images) if bool(getattr(trace_cfg, "save_policy_images", True)) else None
+            dump = tracer.build_dump(
+                meta={
+                    "sample_id": getattr(trace_sample, "sample_id", None),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "model_id": str(Path(cfg.pretrained_checkpoint).name),
+                    "instruction": task_label,
+                    "task_suite": cfg.task_suite_name,
+                    "task_id": trace_task_id,
+                    "episode_idx": trace_episode_idx,
+                    "step_idx": trace_step_idx,
+                    "query_idx": trace_query_idx,
+                    "checkpoint_path": str(cfg.pretrained_checkpoint),
+                },
+                policy_images=policy_images,
+                images_dir=str(getattr(trace_sample, "images_dir", "")),
+                dump_path=str(getattr(trace_sample, "dump_path", "")),
+                perf={"forward_latency_s": float(latency_s)},
             )
+            if dump is not None:
+                trace_writer.write_dump(dump, dump_path=getattr(trace_sample, "dump_path"))
 
     # Extract subset of actions for open loop steps
     return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
