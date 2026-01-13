@@ -33,9 +33,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import wandb
 
 # Monitoring components (optional, imported only when enabled)
+# Monitoring components (optional, imported only when enabled)
 try:
-    from utils.monitoring import Monitor, PruningObserver
-    from utils.monitoring.cogvla import (
+    from monitor import Monitor, PruningObserver
+    from monitor.pruning.adapters.cogvla import (
         CogVLALfpAdapter,
         CogVLAMonitoring,
         CogVLAMonitoringConfig,
